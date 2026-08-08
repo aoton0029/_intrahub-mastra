@@ -1,6 +1,17 @@
 # knowledge-digest-hub
 
-Welcome to your new [Mastra](https://mastra.ai/) project! We're excited to see what you'll build.
+MastraでKnowledgeHubのエージェントとワークフローを実装するプロジェクトです。LLMアクセスはLiteLLMへ統一し、`wiki-model`を使用します。
+
+## LLM接続
+
+`.env.example`を基に次の環境変数を設定します。
+
+```dotenv
+LITELLM_BASE_URL=http://litellm:4000/v1
+LITELLM_MASTER_KEY=<LiteLLM master key>
+```
+
+コンテナは固定名の外部Dockerネットワーク`llm-net`へ参加させます。`wiki-model`はLiteLLMがvLLMの`local-agent-model`へルーティングし、vLLM停止時のみ外部APIへフォールバックします。Mastraへ`VLLM_API_KEY`を渡してはいけません。
 
 ## Getting Started
 
