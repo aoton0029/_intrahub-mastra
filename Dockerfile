@@ -18,8 +18,10 @@ ENV PORT=4111
 
 COPY --from=builder --chown=node:node /app/.mastra/output ./
 
+# DuckDBStore はデフォルトで cwd (/app) 直下に mastra.duckdb を作成するため、
+# COPY --chown ではカバーされない /app 自体の所有権も node に合わせる。
 # LibSQL とオブザーバビリティの書き込み先。compose 側でボリュームをマウントする。
-RUN mkdir -p /app/data && chown node:node /app/data
+RUN chown node:node /app && mkdir -p /app/data && chown node:node /app/data
 
 USER node
 EXPOSE 4111
