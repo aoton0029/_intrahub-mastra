@@ -1,7 +1,7 @@
 # intrahub-mastra プロダクト要求定義書（草案）
 
 > ステータス: 草案・要求定義の正本  
-> 最終更新: 2026-08-12  
+> 最終更新: 2026-08-13  
 > 原案: [codex-chat.md](./codex-chat.md)  
 > 対象実装: `intrahub-mastra` 0.1.x / `@mastra/core` 1.51.x
 
@@ -28,7 +28,7 @@ MediaVault MCPは材料の取得に徹し、要約、Wiki、embedding、Knowledg
 - 単一Agentに調査、執筆、重複判定、ファイル配置まで任せると、出典の欠落、責務の混在、重複ノートの増加が起きやすい。
 - 現在の`intrahub-mastra`はweatherサンプルを中心とする初期構成である一方、LiteLLM接続、storage、observability、scorerを利用できる基盤は存在する。
 - MediaVault MCPにはメタデータ取得用の`search_library`と`get_item_context`が実装済みだが、全文取得用の`get_item_text`とその下位APIは未実装である。
-- Knowledge Vaultを安全に操作する意味論的な`vault-mcp`は未設計・未実装である。
+- Knowledge Vaultは素のMarkdownファイル群であり、規約を守って安全に書き込む手段が用意されていない。frontmatterの必須項目、出典の保持、レビュー済みノートの保護、人手編集との競合検出のいずれも強制されていない。
 
 ## 3. ビジョン
 
@@ -173,18 +173,28 @@ MVP-0では、内容の深い要約ができない場合にメタデータから
 | FR-010 | Criticが主張と出典の対応を検査し、指摘を構造化して返す | 第2段階 |
 | FR-011 | Supervisorが利用者の要求をAgentまたはWorkflowへ委譲する | 第2段階 |
 | FR-012 | 回答に利用した知識とVault変更結果を同時に提示する | 第2段階 |
+| FR-013 | Agentごとに固定の論理モデルを割り当て、実行時に変更しない | MVP-0 |
+| FR-014 | ノート更新は読み取り時の内容と一致することを確認してから置き換え、不一致なら上書きせず停止する | MVP-0 |
+| FR-015 | `reviewed`以降のノートの本文更新をツール側で拒否する | MVP-0 |
 
 ## 11. Agent構成
 
-| Agent | 入力 | 出力 | MediaVault | Knowledge Vault |
-|---|---|---|---|---|
-| `mediaResearchAgent` | Itemコンテキスト、必要に応じて全文チャンク | `ResearchResult` | Read | 原則なし |
-| `knowledgeWriterAgent` | `ResearchResult` | `KnowledgeDraft[]` | なし | Read |
-| `vaultCuratorAgent` | Draftと既存ノート候補 | `CurationPlan`、保存結果 | なし | Read/Write |
-| `knowledgeCriticAgent` | Research結果、Draft、出典 | `CritiqueResult` | Read | Read |
-| `knowledgeOrchestrator` | 利用者の要求と会話履歴 | 回答、委譲結果 | 間接 | 間接 |
+| Agent | 入力 | 出力 | モデル | MediaVault | Knowledge Vault |
+|---|---|---|---|---|---|
+| `mediaResearchAgent` | Itemコンテキスト、必要に応じて全文チャンク | `ResearchResult` | `vllm` | Read | 原則なし |
+| `knowledgeWriterAgent` | `ResearchResult` | `KnowledgeDraft[]` | `anthropic` | なし | Read |
+| `vaultCuratorAgent` | Draftと既存ノート候補 | `CurationPlan`、保存結果 | `vllm` | なし | Read/Write |
+| `knowledgeCriticAgent` | Research結果、Draft、出典 | `CritiqueResult` | `openai` | Read | Read |
+| `knowledgeOrchestrator` | 利用者の要求と会話履歴 | 回答、委譲結果 | `anthropic` | 間接 | 間接 |
 
 上位Agentに低レベルMCPツールを直接渡さない。Supervisorが利用する各subagentには、委譲判断に必要な明確な`description`、入出力形式、利用条件を定義する。
+
+モデル列の値はLiteLLMの論理モデル名である。割当は次の方針で固定する。
+
+- モデル割当をコード上で固定し、Agentにモデルを選択させるツールを提供しない。実行ごとにモデルが変わると§20の自動評価が回帰検出に使えなくなるためである。Supervisorが行うのはモデル選択ではなく担当Agentへの委譲であり、FR-011はこの意味に限定する。
+- `mediaResearchAgent`と`vaultCuratorAgent`はローカルの`vllm`を使う。Researchは原典全文を入力に取りトークン量が最大になるため、費用と外部送信の両面でローカルが適する。Curationは重複判定と配置算出が主で判断の幅が狭い。
+- `knowledgeCriticAgent`は`knowledgeWriterAgent`と別プロバイダにする。同一モデルによる自己評価は甘くなるためである。
+- 論理モデル名を`.env`の単一変数で切り替える構成では役割別の割当ができない。Agentごとに割当を持つモデル定義が必要である。
 
 ## 12. 主要Workflow
 
@@ -310,6 +320,20 @@ status: draft
 
 `status`は少なくとも`draft`、`reviewed`、`verified`を持つ。Critic未実行のノートを自動的に`verified`にしない。
 
+Critic未通過のノートは`status: draft`としてVaultへ保存してよい。保存自体はCriticの実行に依存させず、`reviewed`および`verified`への昇格だけをCritic通過の条件とする。これによりCriticが未実装のMVP-0でも`generateItemKnowledgeWorkflow`は完結し、§9.4の「Criticの判定を品質ゲートとして保存前に強制する運用」は将来の選択肢として残る。
+
+`status`は本プロダクトからの書き込み権限を決める。
+
+| `status` | 本文の更新 | frontmatterへの追加 | 状態の変更 |
+|---|---|---|---|
+| `draft` | 行える | 行える | AIは`reviewed`へ昇格できない |
+| `reviewed` | 行えない | `sources`、`related`、`tags`、`aliases`の追加のみ行える | AIは`verified`へ昇格できない |
+| `verified` | 行えない | 同上 | AIは降格できない |
+
+判定はVault書き込みツールの実装が行い、Agentへの指示に依存しない（FR-015）。プロンプトで「編集しない」と指示してもLLMは時々実行するため、拒否はコードで強制する。`status`の昇格と降格をツールから行えないようにすることで、AIが保護を外してから上書きする経路が閉じる。保護されたノートへの修正は元ノートを変更せず、別ファイルとして書き出す。
+
+ノートの版識別子はfrontmatterに持たせない。読み取り時にファイルの内容から導出し、書き込み前に同じ導出を行って一致を確認する（FR-014）。人間の編集はツールを経由しないため、frontmatterに埋めた版番号は更新されず競合検出に使えない。同じ理由でmtimeも使わない。Vaultはmergerfs上にあり、エディタと同期処理がmtimeを保存または書き換えるため、同一秒内の保存と内容を変えない`touch`を両方誤判定する。
+
 ## 15. ToolおよびMCP境界
 
 ```text
@@ -318,14 +342,10 @@ intrahub-mastra
 │  ├─ search_library       # Read
 │  ├─ get_item_context     # Read
 │  └─ get_item_text        # Read、MVP-1、未実装
-├─ Vault MCP
-│  ├─ search_notes         # Read
-│  ├─ read_note            # Read
-│  ├─ create_note          # Write
-│  ├─ update_note          # Write
-│  ├─ move_note            # Write
-│  ├─ list_links           # Read
-│  └─ get_backlinks        # Read
+├─ Vault Tools（内部ツール、Knowledge Vaultを直接読み書きする）
+│  ├─ createNote           # Write、排他作成
+│  ├─ updateNote           # Write、読み取り時の内容と一致した場合のみ置換
+│  └─ moveNote             # Write、配置を再算出して移動
 └─ Internal Tools
    ├─ normalizeKnowledge
    ├─ validateSources
@@ -335,6 +355,33 @@ intrahub-mastra
 ```
 
 `mediaResearchAgent`にMediaVault MCPの`create_item`、`update_consumption`、`organize_item`、`relate_items`、`add_access_link`を渡さない。MCPトークン自体が書き込み権限を持つ間は、Mastra側のツール選別を必須の防御線とする。
+
+### 15.1 Knowledge Vaultへの読み書きにMCPサーバーを立てない
+
+Knowledge Vaultは素のMarkdownファイル群である。ナレッジ領域全体を`/workspace`へread-writeで1つmountし、配下の`ai-workspace`と`second-brain`の双方へ直接到達する。同一プロセス内にファイルがあるため、プロセス境界を越えるためのMCPを挟まない。
+
+- **読み取りは専用ツールを作らない。** 検索、本文取得、発リンク、被リンクはいずれもファイル走査とパターン検索で足りる。専用ツールを作ると`rg`より遅く表現力の低い再実装になる。
+- **書き込みだけをツールにする。** プロンプトで代替できないのは、読み取りから書き込みまでの一致確認を1操作にすること（FR-014）と、`reviewed`以降のノートの本文更新を拒否すること（FR-015）の2点である。この2つはツールがファイル書き込みを所有していなければ成立しない。
+- **守る相手はLLMである。** ホスト上の別プロセスや人間の編集は、MCPサーバーにしても止められない。脅威が同じであれば、HTTPを1段挟む意味がない。LLMはツールを通してしか作用しないため、mountがread-writeであること自体は権限にならない。
+- **強制はツールのパス制限が担う。** 中間ファイル用の自由書き込みツールは`ai-workspace`配下だけに限定する。`second-brain`へ到達できるのは`createNote`、`updateNote`、`moveNote`の3つだけとし、いずれもFR-014とFR-015を通す。両方の領域に書き込みが必要なのでmountのread-only指定では分けられず、パス制限が唯一の境界になる。
+- 書き込みツールは`vaultCuratorAgent`にだけ渡す。
+
+### 15.2 メインPCのAIクライアントからの利用
+
+利用者が対話的に使うAIクライアントはミニPCのファイルへ直接到達できないため、Sambaの`Knowledge`共有経由でVaultを扱う。専用のMCPサーバーを設けない。
+
+この経路では一致確認と保護が効かず、生の編集ができる。対話セッションには人間が介在し、編集内容を確認して差し戻せるため許容する。強制が必要なのは無人で走る定期処理であり、そこはMastraのツールが担う。
+
+### 15.3 IntraHub側の対応
+
+本節の構成に必要なIntraHub側の定義は揃っている。
+
+| 前提 | 対応 |
+|---|---|
+| Mastraからナレッジ領域全体へ到達する | `KNOWLEDGE_SOURCE`を`/workspace`へread-writeでmountする |
+| メインPCのAIクライアントから到達する | Sambaの`Knowledge`共有として公開する |
+
+`mastra`の`/workspace`はナレッジ領域全体を指す。`hermes-agent`と`open-deep-research`の`/workspace`は`AI_WORKSPACE_SOURCE`だけを指し、範囲が異なる。両者は`second-brain`を扱わないため区別してよいが、コンテナ内パスが同名で範囲が違う点に注意する。
 
 ## 16. MediaVault側への依存要求
 
@@ -353,10 +400,12 @@ intrahub-mastra
 
 ## 17. セキュリティと安全性
 
-- MediaVault MCPとVault MCPは認証済みの内部経路からのみ接続する。
+- MediaVault MCPはBearerトークンで認証する。Knowledge Vaultはbind mountで到達し、マウント範囲がアクセス境界になる。
 - トークン、APIキー、原典本文をログへ出力しない。
 - Agentへ渡すツールを責務ごとにallowlist化する。
 - Curator以外のAgentにVault書き込みツールを渡さない。
+- レビュー済みノートの本文更新をVault書き込みツールが拒否する。拒否された内容は元ノートを変更せず別ファイルへ書き出す。
+- Vault書き込みツールはマウント範囲外へ書かない。相対パスによる脱出、絶対パス、symlink経由の脱出を拒否する。
 - ノート削除ツールはMVPで提供しない。
 - `dryRun`で保存計画と差分を確認できるようにする。
 - 同名ノート候補を一意に解決できない場合は書き込みを停止する。
@@ -375,7 +424,7 @@ Workflow run ID、各Stepの状態、利用Agent、モデル、レイテンシ�
 
 ### NFR-003: 障害分離
 
-MediaVault MCP接続失敗、MediaVault API到達失敗、抽出未実行、Vault MCP失敗、スキーマ検証失敗、LLM失敗を区別して返す。
+MediaVault MCP接続失敗、MediaVault API到達失敗、抽出未実行、Vault書き込み失敗、競合検出、保護による拒否、スキーマ検証失敗、LLM失敗を区別して返す。
 
 ### NFR-004: 再実行可能性
 
@@ -384,6 +433,17 @@ MediaVault MCP接続失敗、MediaVault API到達失敗、抽出未実行、Vaul
 ### NFR-005: 応答サイズ
 
 原典全文はチャンク取得し、単一のAgentコンテキストまたはWorkflow出力へ無制限に蓄積しない。
+
+1回のWorkflow実行の取得上限を次の既定値で固定する。値は設定で変更できるようにし、コード内へ直接埋め込まない。
+
+| 対象 | 既定の上限 |
+|---|---|
+| Item数 | 5 |
+| Itemあたりのファイル数 | 3 |
+| チャンク数（実行合計） | 50 |
+| `mediaResearchAgent`への入力累計トークン | 120,000 |
+
+上限に達した場合は取得を打ち切り、打ち切った対象と理由を`warnings`へ含めて返す。上限超過を無言で切り捨てない。
 
 ### NFR-006: 品質評価
 
@@ -428,15 +488,16 @@ Scorerはライブ監視だけに依存せず、固定データセットを用�
 ## 21. 実装順
 
 1. Knowledge Note、ResearchResult、CurationPlan、WorkflowResultのZodスキーマを確定する。
-2. `vault-mcp`のRead/Writeツール契約、認証、dry-run、競合時の挙動を設計する。
-3. `@mastra/mcp`を追加し、MediaVault MCPのRead Onlyツールだけを接続する。
-4. `mediaResearchAgent`と`knowledgeWriterAgent`を実装する。
-5. `vaultCuratorAgent`とVault MCP接続を実装する。
-6. `generateItemKnowledgeWorkflow`を`metadata_only`で完成させる。
-7. MediaVault側の`get_item_text`実装後に`full_text`モードを追加する。
-8. 評価データセットとscorerを整備する。
-9. `knowledgeCriticAgent`を保存前の検証工程へ追加する。
-10. 最後に`knowledgeOrchestrator`をSupervisor Agentとして追加する。
+2. Knowledge VaultをMastraへbind mountし、`createNote`、`updateNote`、`moveNote`を実装する。一致確認と保護をここで強制する。
+3. Agentごとに論理モデルを割り当てられるモデル定義へ変更する（FR-013）。
+4. `@mastra/mcp`を追加し、MediaVault MCPのRead Onlyツールだけを接続する。
+5. `mediaResearchAgent`と`knowledgeWriterAgent`を実装する。
+6. `vaultCuratorAgent`へVault書き込みツールを渡して実装する。
+7. `generateItemKnowledgeWorkflow`を`metadata_only`で完成させる。
+8. MediaVault側の`get_item_text`実装後に`full_text`モードを追加する。
+9. 評価データセットとscorerを整備する。
+10. `knowledgeCriticAgent`を保存前の検証工程へ追加する。
+11. 最後に`knowledgeOrchestrator`をSupervisor Agentとして追加する。
 
 ## 22. ディレクトリ構成案
 
@@ -485,7 +546,9 @@ src/mastra/
 | リスク | 影響 | 対策 |
 |---|---|---|
 | `get_item_text`の実装が遅れる | 原典本文を使った知識化ができない | `metadata_only`のMVP-0を先行する |
-| Vault MCPが未設計 | 安全な保存経路がない | Agent実装より先に契約とdry-runを確定する |
+| Vault書き込みツールの契約が未確定 | 保存経路の実装に着手できない | 一致確認と保護の挙動をAgent実装より先に確定する（§15.1） |
+| 人手編集とWorkflowが同じノートを更新する | ロストアップデート | 読み取り時の内容と一致することを確認してから置換し、不一致なら停止して再読込する（FR-014） |
+| Agent別のモデル割当が実装に反映されない | 評価の再現性が失われる | モデル定義をAgentごとの割当へ変更してからAgentを実装する（FR-013） |
 | LLMがツールと構造化出力を同時利用できない | スキーマ出力またはツール呼び出しが失敗する | Workflow Stepを分離し、必要なら構造化専用モデルを使う |
 | 重複判定の誤り | ノート増殖または誤更新 | title、alias、type、sourceを併用し、曖昧時は停止する |
 | 長い原典でコンテキストが肥大化する | コスト、遅延、品質低下 | チャンク選択、上限、段階的要約、取得記録を導入する |
@@ -493,14 +556,23 @@ src/mastra/
 
 ## 24. 未決事項
 
-1. `vault-mcp`を`intrahub-mastra`内に置くか、独立サービスにするか。
-2. Knowledge Vaultの正確なディレクトリ規約と、ノート種別ごとの配置先。
-3. ノート更新の競合制御をmtime、content hash、revision IDのどれで行うか。
-4. Critic未通過ノートを自動保存するか、dry-runまたは`draft`保存に限定するか。
-5. 1回のWorkflowで取得可能なItem数、ファイル数、チャンク数、トークン量の上限。
-6. 人手レビュー済みノートをAIが更新できる範囲と保護方法。
-7. `get_item_text`でPDFページ、EPUB章、固定文字数チャンクをどう統一して参照するか。
-8. Supervisor Agentの会話メモリとKnowledge Vaultの知識をどこまで分離するか。
+1. `get_item_text`でPDFページ、EPUB章、固定文字数チャンクをどう統一して参照するか。
+4. Supervisor Agentの会話メモリとKnowledge Vaultの知識をどこまで分離するか。
+5. `second-brain`配下のノート種別ごとの配置先と`calculateNotePath`の規則。中間ファイルを`ai-workspace`、最終ファイルを`second-brain`へ置くことは決まっているが、`second-brain`内の構造は未定である。
+6. 中間ファイルから最終ファイルへの昇格を誰が行うか。Workflowが`second-brain`へ直接書くのか、`ai-workspace`へ出して人間が移すのか。
+7. `knowledgeOrchestrator`へ割り当てる論理モデル。§11では`anthropic`を置いているが、委譲判断の品質と費用の兼ね合いを実測で確認する。
+8. Agent別のモデル割当を`.env`で切替可能にするか、コード固定に留めるか。切替可能にすると§20の評価結果とモデルの対応が追えなくなる。
+9. Knowledge Vaultをgit管理して定期commitするか。上書き事故が事後回復可能になり、FR-014の重要度が下がる。
+
+次の各件は決定済みのため本一覧から外し、該当節へ反映した。
+
+| 決定した事項 | 反映先 |
+|---|---|
+| Knowledge Vaultの読み書きに専用MCPサーバーを立てず、Mastraの内部ツールとファイル走査で行う | §15.1、§15.2 |
+| ノート更新の競合制御をノート内容の一致確認で行う | §14、FR-014 |
+| 人手レビュー済みノートをAIが更新できる範囲と保護方法 | §14、§17、FR-015 |
+| Critic未通過ノートは`draft`として保存し、昇格だけをCritic通過の条件とする | §14 |
+| 1回のWorkflowの取得上限を既定値で固定し、設定で変更可能にする | NFR-005 |
 
 ## 25. 関連文書
 
