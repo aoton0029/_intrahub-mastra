@@ -1,761 +1,237 @@
-現状の2リポジトリを見る限り、`intrahub-mastra` は「MediaVaultをAI化する層」ではなく、**MediaVaultを情報源としてKnowledge Vaultを生成・維持する知識処理層**にするのがよいです。
+# Knowledge Vault設計方針
 
-MediaVault側のPRDでも、MCPは要約・Wiki・embeddingを所有せず、生成物の正本はKnowledgeHub Vaultに置く、と明確に分離されています。KnowledgeHubエージェントは `get_item_context` / `get_item_text` で材料を取得し、Vault側へ保存する想定です。 
+## 目的
 
-一方、現在の `intrahub-mastra` はMastraの初期テンプレートに近く、weather agent / workflow / toolが残っている状態です。ストレージ、observability、LiteLLM経由のモデル接続基盤はすでに使える形になっています。 
+`intrahub-mastra`を、MediaVaultや外部資料からKnowledge Vaultを生成・維持する知識処理層とする。
 
-なので、次の構成を推します。
+主な用途は次のとおり。
 
-```text
-                     ┌─────────────────────┐
-                     │ User / Scheduler    │
-                     └──────────┬──────────┘
-                                │
-                     ┌──────────▼──────────┐
-                     │ Knowledge Orchestrator
-                     │     Agent           │
-                     └──────────┬──────────┘
-                                │
-            ┌───────────────────┼─────────────────────┐
-            │                   │                     │
-    ┌───────▼────────┐  ┌──────▼────────┐   ┌───────▼────────┐
-    │ Research Agent │  │ Knowledge      │   │ Vault Curator  │
-    │                │  │ Writer Agent   │   │ Agent          │
-    └───────┬────────┘  └──────┬────────┘   └───────┬────────┘
-            │                   │                     │
-       MediaVault MCP      structured data        Vault MCP
-            │                   │                     │
-     ┌──────▼──────┐            │              ┌─────▼─────┐
-     │ MediaVault  │            └─────────────►│Knowledge  │
-     │ API/files   │                           │Vault      │
-     └─────────────┘                           └───────────┘
-```
+- 作品全体および話数ごとの要約・批評
+- 論文・専門書の章ごとの要約
+- 作品、論文、専門書、Webを横断したテーマ・専門用語の整理
+- タグ、カテゴリ、リンクの生成と整理
+- Knowledge Vaultを利用した検索・回答と継続的な更新
 
-## 1. 最上位は `KnowledgeOrchestratorAgent`
+## 責務の境界
 
-これはユーザーと直接話す唯一のエージェントにします。
+| 対象 | 責務 |
+|---|---|
+| MediaVault | 作品・文献のメタデータ、ファイル参照、抽出済みテキストを管理するサービス |
+| intrahub-mastra | 資料収集、分析、要約、批評、知識統合、Vault更新の制御 |
+| Knowledge Vault | Obsidianで利用する整理済み知識の正本 |
+| `ai-workspace` | 章分割、下書き、レビュー結果など再生成可能な中間データ |
 
-役割は「回答する」ことより、**要求を知識処理タスクへ分解すること**です。
+PDF、映像、OCR全文はKnowledge Vaultへ複製しない。Vaultには、それらから生成した知識と出典参照を保存する。Knowledge生成を理由にMediaVaultのItem、評価、視聴状況、タグ、カテゴリを変更しない。
 
-例えば、
-
-> 攻殻機動隊について自分の持っている資料から整理して
-
-という入力なら、
+## 全体構成
 
 ```text
-KnowledgeOrchestrator
-
-1. Vaultに既存ノートがあるか調査
-2. MediaVaultから攻殻機動隊関連Item検索
-3. 関連する本・映画・アニメ・論文を取得
-4. 必要なら全文取得
-5. Research Agentへ分析依頼
-6. Knowledge Writerへノート生成依頼
-7. Curatorへリンク・タグ・配置依頼
-8. ユーザーへ結果を返す
+User / Scheduler
+        │
+        ▼
+Knowledge Orchestrator
+        │
+        ├── Media Research ── MediaVault MCP
+        ├── Knowledge Writer
+        ├── Knowledge Critic
+        └── Vault Curator ─── Knowledge Vault
 ```
 
-と判断します。
+決まった手順を持つ処理はWorkflowとし、ユーザー要求に応じたWorkflowの選択と組み合わせをOrchestratorが担当する。
 
-重要なのは、このAgent自身にはできるだけ低レベルツールを直接渡さないことです。
+## Agentの責務
 
-Mastraでは複数Agent/Workflowを動的にルーティングする構成が可能で、実行経路が不定な仕事はAgent Network、決まった処理はWorkflowに向いています。 
+| Agent | 責務 |
+|---|---|
+| `knowledgeOrchestrator` | 要求の解釈、既存知識の確認、Workflowの選択 |
+| `mediaResearchAgent` | MediaVaultや外部資料の検索、出典付き調査結果の作成 |
+| `knowledgeWriterAgent` | 調査結果をノート種別に応じた知識へ変換 |
+| `knowledgeCriticAgent` | 出典、事実と解釈、矛盾、過度な一般化の検証 |
+| `vaultCuratorAgent` | 重複判定、配置、frontmatter、タグ、リンク、更新差分の管理 |
 
-ただし最初から巨大なAgent Networkにする必要はありません。
+Agent間ではMarkdownを直接受け渡さず、出典、主張、概念、関係、不確実性を含む構造化データを使用する。
 
-むしろ、
-
-```text
-Supervisor Agent
-   ↓
-専門Agent
-   ↓
-Workflow
-   ↓
-Tool/MCP
-```
-
-という4層にします。
-
----
-
-## 2. `MediaResearchAgent`
-
-これはMediaVault専属です。
-
-責務：
-
-```text
-・作品を探す
-・関連作品を辿る
-・資料を集める
-・全文を取得する
-・出典を管理する
-・複数資料を比較する
-```
-
-使用可能ツールは原則Read Only。
-
-MediaVault PRDにある、
-
-```text
-search_library
-get_item_context
-get_item_text
-
-将来的に
-get_job
-list_jobs
-enqueue_job
-```
-
-だけで十分です。MediaVaultのMCPはREST APIをそのまま公開せず、目的単位ツールにする設計なので、このAgentとの相性がよいです。 
-
-逆に、
-
-```text
-create_item
-update_consumption
-organize_item
-relate_items
-```
-
-などはResearch Agentには渡さない方がいいです。
-
-ResearchAgentの出力は自然文ではなく、例えばこうします。
-
-```ts
-type ResearchResult = {
-  topic: string;
-
-  sources: {
-    itemId: string;
-    title: string;
-    mediaType: string;
-    fileId?: string;
-    extractedAt?: string;
-  }[];
-
-  facts: {
-    statement: string;
-    sourceItemIds: string[];
-    confidence: number;
-  }[];
-
-  concepts: {
-    name: string;
-    description: string;
-    sourceItemIds: string[];
-  }[];
-
-  relationships: {
-    from: string;
-    to: string;
-    relation: string;
-    evidence: string;
-  }[];
-
-  uncertainties: string[];
-};
-```
-
-ここがかなり重要です。
-
-**Research Agent → Writer AgentをMarkdownで繋がない**ことを勧めます。
-
-構造化データで渡します。
-
----
-
-## 3. `KnowledgeWriterAgent`
-
-Vaultに保存可能な「知識」に変換するAgentです。
-
-Research Agentと役割を分けます。
-
-Research Agent：
-
-```text
-資料に何が書かれているか
-```
-
-Writer Agent：
-
-```text
-それをどういう知識単位に整理するか
-```
-
-を担当します。
-
-生成対象は一種類にしない方がよいです。
-
-例えば：
-
-```text
-SourceNote
-ConceptNote
-WorkNote
-PersonNote
-TopicNote
-ComparisonNote
-TimelineNote
-EssayNote
-```
-
-とします。
-
-例えば『攻殻機動隊』なら、
-
-```text
-works/
-  攻殻機動隊.md
-
-concepts/
-  ゴースト.md
-  電脳化.md
-  義体化.md
-
-people/
-  士郎正宗.md
-  押井守.md
-
-topics/
-  攻殻機動隊における身体と自己.md
-```
-
-のようになります。
-
-ここで単なる「作品Wiki」を生成させないのがポイントです。
-
-Knowledge Vaultなので、
-
-```text
-作品
-人物
-概念
-出来事
-主張
-引用
-テーマ
-関係
-```
-
-を知識単位にできるようにします。
-
----
-
-## 4. `VaultCuratorAgent`
-
-これはかなり重要です。
-
-Writerが文章を書き、Curatorが**Vaultの構造を管理する**ように分離します。
-
-担当：
-
-```text
-・既存ノート検索
-・重複検出
-・新規/更新判定
-・ファイル名決定
-・ディレクトリ決定
-・タグ付与
-・frontmatter生成
-・wikilink生成
-・backlink候補生成
-・alias統合
-```
-
-例えばWriterが、
-
-```text
-ゴーストとは攻殻機動隊世界における……
-```
-
-と生成した場合、
-
-Curatorは、
-
-```text
-既存:
-concepts/ゴースト.md
-
-→ 新規作成しない
-→ 既存ノートへsection追加
-```
-
-と判断します。
-
-つまり、
-
-```text
-Writer = Knowledge Content
-Curator = Knowledge Structure
-```
-
-です。
-
-この分離によってVaultがAI生成ファイルで爆発するのを防げます。
-
----
-
-## 5. `KnowledgeCriticAgent`
-
-これはMVP後でもよいですが、かなり有用です。
-
-チェックだけします。
-
-```text
-Writer
-   ↓
-Critic
-   ↓
-Curator
-```
-
-チェック項目：
-
-```text
-出典があるか
-出典から言えないことを書いていないか
-事実と解釈を混同していないか
-既存知識と矛盾していないか
-過度に一般化していないか
-リンク対象が適切か
-```
-
-特にあなたのVaultでは映画・漫画・本・論文など異種資料を扱うので、
-
-```text
-Fact
-Interpretation
-Inference
-Opinion
-```
-
-を区別させるとかなり価値があります。
-
-例えばfrontmatterにも、
-
-```yaml
-knowledge_type: concept
-confidence: high
-
-sources:
-  - mediavault:item:019...
-  - mediavault:item:01a...
-
-generated:
-  agent: knowledge-writer
-  model: wiki-model
-  reviewed_by: knowledge-critic
-```
-
-のようなprovenanceを残します。
-
-MediaVault PRDでも、生成ノートから元Itemを追跡できることを重視しています。 
-
----
-
-# AgentよりWorkflowにするべき処理
-
-ここは重要です。
-
-全部Agentにしない方がいいです。
-
-例えば「作品からWikiを作る」は実行手順がほぼ確定しています。
-
-なので、
-
-```text
-generateItemKnowledgeWorkflow
-
-input
-  itemId
-
-↓ getItemContext
-
-↓ getItemText
-
-↓ researchAgent
-
-↓ knowledgeWriterAgent
-
-↓ criticAgent
-
-↓ vaultCuratorAgent
-
-↓ vault.write
-
-output
-  createdNotes
-  updatedNotes
-  sources
-```
-
-と deterministic workflow にします。
-
-Mastra自身も、処理順序が決まっている場合はWorkflow、実行経路をAIに選択させたい場合はAgent Networkを使うという整理をしています。 
-
-同様に、
-
-```text
-generateItemKnowledgeWorkflow
-updateItemKnowledgeWorkflow
-researchTopicWorkflow
-digestNewItemsWorkflow
-rebuildLinksWorkflow
-```
-
-を作ります。
-
----
-
-# 推奨する最終Agent構成
-
-最初は5体で十分です。
-
-| Agent | 責務 | MediaVault | Vault |
-|---|---|---|---|
-| `knowledgeOrchestrator` | 意図理解・委譲 | 間接 | 間接 |
-| `mediaResearchAgent` | 資料収集・分析 | Read | Read |
-| `knowledgeWriterAgent` | 知識文章生成 | なし | Read |
-| `vaultCuratorAgent` | Vault構造管理 | なし | Read/Write |
-| `knowledgeCriticAgent` | 出典・整合性検証 | Read | Read |
-
-これ以上細分化するのは後からでよいです。
-
-例えば将来的に、
-
-```text
-filmAnalysisAgent
-literatureAnalysisAgent
-gameAnalysisAgent
-academicResearchAgent
-```
-
-を作ることはできます。
-
-ただし最初からメディア種別ごとにAgentを作るのは避けます。
-
-代わりに、
-
-```text
-mediaResearchAgent
-   +
-media-specific instructions / skills
-```
-
-にした方が保守しやすいです。
-
----
-
-# Tool/MCPの境界
-
-私ならこう切ります。
+## ToolとMCPの境界
 
 ```text
 Mastra
-│
-├─ MediaVault MCP
-│   ├─ search_library
-│   ├─ get_item_context
-│   ├─ get_item_text
-│   └─ jobs...
-│
-├─ Vault MCP
-│   ├─ search_notes
-│   ├─ read_note
-│   ├─ create_note
-│   ├─ update_note
-│   ├─ move_note
-│   ├─ list_links
-│   └─ get_backlinks
-│
-└─ Internal Tools
-    ├─ normalizeKnowledge
-    ├─ validateFrontmatter
-    ├─ calculateNotePath
-    └─ diffNote
+├── MediaVault MCP
+│   ├── search_library
+│   ├── get_item_context
+│   └── get_item_text
+├── Vault MCP
+│   ├── search_notes
+│   ├── read_note
+│   ├── create_note
+│   ├── update_note
+│   └── find_related_notes
+└── Internal Tools
+    ├── frontmatter検証
+    ├── 出典検証
+    ├── パス決定
+    └── 差分生成
 ```
 
-MastraはMCPClient経由でMCP serverのtools/resourcesをAgentへ渡せます。現在の `intrahub-mastra` には `@mastra/mcp` がまだ依存関係にないので、MediaVault MCP接続を実装する段階で追加することになります。 
+Media ResearchにはMediaVaultのRead Onlyツールだけを渡す。Vault操作は汎用ファイル操作ではなく、ノートの作成・更新・検索という意味を持つ操作として公開する。
 
-特に、
+# Knowledge Vaultの構成
 
-**Vaultを単純なfilesystem MCPとして渡すのはあまり勧めません。**
-
-`write_file` のような低レベルツールではなく、
+実環境では`/srv/knowledge`をMastraへ`/workspace`としてマウントする。
 
 ```text
-create_note
-update_note
-find_related_notes
-search_notes
-resolve_note
+/srv/knowledge/
+├── ai-workspace/               # 中間データ
+└── second-brain/               # Obsidian Vault
+    ├── 00 Inbox/               # 人手確認が必要なノート
+    ├── 10 Sources/             # 資料単位のノート
+    │   ├── Works/
+    │   ├── Papers/
+    │   ├── Academic Books/
+    │   └── Web/
+    ├── 20 Knowledge/           # 再利用する知識
+    │   ├── Concepts/
+    │   ├── Themes/
+    │   ├── People/
+    │   ├── Organizations/
+    │   └── Events/
+    ├── 30 Syntheses/           # 比較・年表・論考
+    ├── 40 Maps/                # MOC・索引
+    ├── 90 Meta/                # テンプレート、分類、検証レポート
+    └── Attachments/            # Vault固有の小規模な添付
 ```
 
-くらいの意味論を持った `vault-mcp` を作る方が安全です。
+ディレクトリは閲覧上の大分類に留め、ノート種別はfrontmatterの`type`で管理する。
 
-これはMediaVault MCPの「REST APIをそのままAIへ公開しない」という設計思想とも揃います。 
+## ノート種別
 
----
+| 種別 | 用途 |
+|---|---|
+| `work` | 作品全体の概要、構成、主題、関連資料 |
+| `episode` | 話数ごとの要約、批評、作品内での位置づけ |
+| `paper` | 論文全体の書誌情報、主張、章一覧 |
+| `academic_book` | 専門書全体の書誌情報、主張、章一覧 |
+| `chapter` | 章・節ごとの要約、根拠、重要語 |
+| `concept` | 「唯識」などの専門用語・概念 |
+| `theme` | 複数資料を横断する問い・テーマ |
+| `person` | 人物と作品・概念との関係 |
+| `comparison` | 複数の作品、定義、理論の比較 |
+| `timeline` | 出来事や研究史の時系列整理 |
+| `essay` | 出典に基づく統合的な論考 |
 
-# Knowledge Vaultのデータモデル
+## 作品と話数
 
-Markdown本文だけでなく、最低限このfrontmatterを共通化するとよいです。
+作品全体と話数を分離し、長編作品でもノートが肥大化しない構成にする。
+
+```text
+10 Sources/Works/{作品名}/
+├── index.md
+└── Episodes/
+    ├── S01E01 {話数タイトル}.md
+    └── S01E02 {話数タイトル}.md
+```
+
+話数ノートは、要約、構成、登場人物、主題、批評、作品全体での位置づけ、関連ノート、出典を持つ。要約は原典に明示された内容、批評は解釈として区別する。MediaVault上の話数と原典ファイルを一意に対応づけられない場合は推測で確定せず、確認対象とする。
+
+## 論文・専門書
+
+論文と専門書は資料全体の`index.md`と、章・節単位のノートに分ける。
+
+```text
+10 Sources/Papers/{著者}-{年}-{短縮タイトル}/
+├── index.md
+└── Sections/
+
+10 Sources/Academic Books/{著者}-{年}-{短縮タイトル}/
+├── index.md
+└── Chapters/
+```
+
+章ノートは、章の目的、要約、主要な主張、根拠・事例、重要語、疑問・反論、出典を持つ。章境界は抽出結果のラベルや目次を優先し、OCR本文から推定した場合は人手確認の対象にする。
+
+## テーマ・専門用語
+
+ThemeとConceptは作品、論文、専門書、Web資料を横断する。
+
+Themeノートでは、問い、対象範囲、資料ごとの定義、共通点と相違点、歴史的文脈、作品例、論争点、暫定的な結論を整理する。Conceptノートでは、定義、原語、別名、系譜、主要概念、学説上の相違、用例、誤解しやすい点を整理する。
+
+Web検索結果は補助資料として扱い、検索結果のスニペットだけを根拠にしない。可能な限り一次資料、査読論文、専門書を優先する。
+
+# メタデータと出典
+
+全ノートは共通frontmatterを持つ。
 
 ```yaml
 ---
-id: kh_01...
-title: ゴースト
-
+id: kv_01J...
+title: 唯識
 type: concept
-
-aliases:
-  - ghost
-
-tags:
-  - philosophy
-  - ghost-in-the-shell
-
+aliases: []
+categories: [philosophy]
+tags: [buddhism]
+status: reviewed
 sources:
-  - type: mediavault
+  - kind: mediavault
     item_id: "..."
     file_id: "..."
-    
-related:
-  - "[[攻殻機動隊]]"
-  - "[[電脳化]]"
-
+    extraction_version: "pdf-v1"
+source_refs:
+  - source: 0
+    chunk_index: 12
+    label: p.42-44
 provenance:
-  generated_by: knowledge-writer
-  reviewed_by: knowledge-critic
-  generated_at: 2026-08-11T00:00:00Z
-
-status: verified
+  workflow: research-topic
+  run_id: "..."
+  model: "..."
 ---
 ```
 
-そして本文は、
+出典は`item_id`、`file_id`、`extraction_version`、`chunk_index`の組み合わせで追跡する。`label`はページや章を表示するための補助情報とする。再抽出によって`extraction_version`が変わった場合は既存参照を自動的に読み替えず、再確認対象にする。
 
-```markdown
-# ゴースト
+| `status` | 意味 |
+|---|---|
+| `draft` | AI生成直後 |
+| `review_needed` | 出典不足、推定、競合などがある |
+| `reviewed` | 機械的な検証を通過 |
+| `human_verified` | 人間が内容を確認済み |
+| `stale` | 出典参照が失効している |
 
-## 概要
+# タグ・カテゴリの管理
 
-## 定義
+- `type`: ノートの構造を決める種別
+- `categories`: 少数の大分類
+- `tags`: 横断検索に使用する特徴語
+- Wikilink: 作品、人物、概念など実体間の関係
 
-## 作品内での扱い
+正規のカテゴリ・タグと表記揺れは`90 Meta`のtaxonomyで管理する。自動管理は候補生成、既存語彙への正規化、差分検証、適用の順で行う。
 
-## 解釈
+- 本文と出典に根拠があるタグだけを追加する。
+- 未登録語は直ちに正式タグにせず、提案として蓄積する。
+- 同義語はaliasへ統合する。
+- 人間が追加したタグは既定で保護する。
+- タグが再生成されなかったという理由だけでは削除しない。
+- タグ削除やtaxonomyの統合は原則として確認対象にする。
 
-## 関連概念
+MediaVault側のタグ・カテゴリとは別の分類体系として扱い、Knowledge Vault側の整理結果をMediaVaultへ自動反映しない。
 
-## 出典
-```
+# 主要Workflow
 
-程度にします。
+| Workflow | 用途 |
+|---|---|
+| `generateWorkKnowledgeWorkflow` | 作品全体ノートの生成・更新 |
+| `generateEpisodeKnowledgeWorkflow` | 話数ごとの要約・批評 |
+| `summarizeDocumentWorkflow` | 論文・専門書の章分割と階層要約 |
+| `researchTopicWorkflow` | テーマ・専門用語の横断調査 |
+| `curateTaxonomyWorkflow` | タグ、カテゴリ、リンクの整理 |
+| `refreshStaleSourcesWorkflow` | 失効した出典参照の再調査 |
+| `digestNewItemsWorkflow` | MediaVaultへ追加された資料の処理 |
 
-重要なのは、
+OCR文献は、全文を一度にLLMへ渡さず、チャンク、章、文献全体の順で階層的に要約する。各段階で元の出典参照を維持する。
 
-```text
-MediaVault ID
-       ↓
-Knowledge Note
-       ↓
-他Knowledge Note
-```
+# 検索と更新
 
-というprovenance graphを失わないことです。
+回答時は、Knowledge Vault、MediaVault、必要に応じてWebなどの外部資料の順で検索する。新しい知識は検証後にKnowledge Vaultへ反映する。
 
----
+Vault更新時は既存ノートとの重複、出典、frontmatter、リンク、編集競合を確認する。競合や低信頼な結果は上書きせず`00 Inbox`または検証レポートへ送る。
 
-# RAGはどこに置くか
+`/srv/knowledge`は既存運用どおりGitで履歴を保存し、人手編集やAI更新から復旧できるようにする。
 
-ここもMastraのAgentとは分離した方がいいです。
-
-```text
-                Knowledge Vault
-                     │
-              index / chunk
-                     │
-                Vector DB
-                     │
-User ──► Orchestrator ──► Knowledge Retrieval
-                     │
-                     └──► MediaVault Research
-```
-
-つまり検索順序は原則、
-
-```text
-1. Knowledge Vault RAG
-2. 足りなければMediaVault
-3. 必要なら全文
-4. 新しい知識が得られたらVault更新
-```
-
-です。
-
-毎回MediaVaultの原典から回答すると重いので、Knowledge Vaultを**semantic cacheではなく「整理済み二次知識」**として利用します。
-
-ただし、
-
-```text
-Vault = derived knowledge
-MediaVault = source of truth
-```
-
-という関係は維持します。
-
----
-
-# 質問への処理例
-
-ユーザー：
-
-> 押井守の映画で身体性についてどういう傾向がある？
-
-処理：
-
-```text
-Orchestrator
- │
- ├─ Vault検索
- │    ├─ [[押井守]]
- │    ├─ [[身体性]]
- │    └─ 関連ノート
- │
- └─ 情報不足を検出
-      │
-      ▼
- ResearchAgent
-      │
-      ├─ MediaVault search_library
-      │      ├─ 攻殻機動隊
-      │      ├─ イノセンス
-      │      └─ ...
-      │
-      ├─ get_item_context
-      └─ get_item_text
-             │
-             ▼
-      structured ResearchResult
-             │
-      ┌──────┴───────┐
-      ▼              ▼
-   Writer          Answer
-      │
-    Critic
-      │
-   Curator
-      │
- Vault更新
-```
-
-この構造にすると、ユーザーとの会話そのものがVaultを徐々に育てます。
-
----
-
-# ディレクトリ構成
-
-現在の `weather-*` を置き換えて、私はこうします。
-
-```text
-src/mastra/
-├── agents/
-│   ├── knowledge-orchestrator.ts
-│   ├── media-research-agent.ts
-│   ├── knowledge-writer-agent.ts
-│   ├── knowledge-critic-agent.ts
-│   └── vault-curator-agent.ts
-│
-├── workflows/
-│   ├── generate-item-knowledge.ts
-│   ├── update-item-knowledge.ts
-│   ├── research-topic.ts
-│   ├── digest-new-items.ts
-│   └── curate-vault.ts
-│
-├── mcp/
-│   ├── mediavault.ts
-│   └── vault.ts
-│
-├── tools/
-│   ├── knowledge/
-│   │   ├── normalize-knowledge.ts
-│   │   ├── validate-sources.ts
-│   │   └── diff-knowledge.ts
-│   └── vault/
-│       └── validate-frontmatter.ts
-│
-├── schemas/
-│   ├── research-result.ts
-│   ├── knowledge-note.ts
-│   └── provenance.ts
-│
-├── prompts/
-│   ├── researcher.ts
-│   ├── writer.ts
-│   ├── critic.ts
-│   └── curator.ts
-│
-├── models/
-│   └── litellm.ts
-│
-├── scorers/
-│   ├── citation-grounding.ts
-│   ├── hallucination.ts
-│   ├── knowledge-quality.ts
-│   └── vault-structure.ts
-│
-└── index.ts
-```
-
-今の `intrahub-mastra` にはすでにscorer/observability/storageの基盤があるので、特にScorerは活用した方がいいです。 
-
----
-
-## 実装順
-
-一気にMulti-Agent化するより、次の順が安定します。
-
-1. `vault-mcp` のRead/Write APIを決める。
-2. `MediaVault MCP Client` をMastraへ接続。
-3. `mediaResearchAgent` を作る。
-4. `knowledgeWriterAgent` を作る。
-5. `generateItemKnowledgeWorkflow` を作る。
-6. `vaultCuratorAgent` を追加。
-7. `knowledgeCriticAgent` を追加。
-8. 最後に `knowledgeOrchestrator` を作って各Workflow/Agentを束ねる。
-
-特に最初の完成形は、
-
-```text
-MediaVault
-   ↓
-ResearchAgent
-   ↓
-WriterAgent
-   ↓
-CuratorAgent
-   ↓
-Knowledge Vault
-```
-
-だけで十分です。
-
-その後、
-
-```text
-Knowledge Vault
-     ↑       ↓
-     └ Orchestrator
-           ↓
-       MediaVault
-```
-
-という自己成長型のKnowledge Vaultに発展させるのが、この2リポジトリの現在の設計と最も整合します。MediaVaultは原典・メタデータの正本、Mastraは知識生成ロジック、Knowledge Vaultは生成された知識の正本、という3者分離です。 
-
-次に詰めるなら、`intrahub-mastra` にそのまま実装できるレベルまで、**各Agentのsystem prompt、Zod入出力schema、使用可能MCP tools、Mastra Workflowの具体的なTypeScript構成**まで落とすのがよいです。
