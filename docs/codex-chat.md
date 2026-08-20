@@ -58,10 +58,6 @@ Agent間ではMarkdownを直接受け渡さず、出典、主張、概念、関�
 
 ```text
 Mastra
-├── MediaVault MCP
-│   ├── search_library
-│   ├── get_item_context
-│   └── get_item_text
 ├── Vault MCP
 │   ├── search_notes
 │   ├── read_note
